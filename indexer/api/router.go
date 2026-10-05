@@ -212,9 +212,12 @@ func (rl *perClientRateLimiter) evictOldest() {
 	var oldestKey string
 	var oldestTime time.Time
 	for key, bucket := range rl.buckets {
-		if oldestKey == "" || bucket.last.Before(oldestTime) {
+		bucket.mu.Lock()
+		last := bucket.last
+		bucket.mu.Unlock()
+		if oldestKey == "" || last.Before(oldestTime) {
 			oldestKey = key
-			oldestTime = bucket.last
+			oldestTime = last
 		}
 	}
 	if oldestKey != "" {
@@ -285,8 +288,15 @@ func NewRouter(h *APIHandler) (*chi.Mux, func()) {
 	rl := newPerClientRateLimiter(h.cfg.RateLimitRPS, h.cfg.RateLimitRPS*2, 1000)
 	invoiceLimiter := indexermiddleware.NewInvoiceRateLimiterWithConfig(h.cfg.InvoiceRateLimit, h.cfg.InvoiceRateLimitWindow)
 
-	// Prometheus metrics
-	r.Get("/metrics", MetricsHandler().ServeHTTP)
+	// Prometheus metrics are public for local development, but deployments can
+	// require a bearer token without changing the scrape URL.
+	metrics := MetricsHandler().ServeHTTP
+	if h.cfg.MetricsToken == "" {
+		slog.Warn("metrics endpoint is unauthenticated; set METRICS_TOKEN in production")
+		r.Get("/metrics", metrics)
+	} else {
+		r.With(metricsTokenMiddleware(h.cfg.MetricsToken)).Get("/metrics", metrics)
+	}
 
 	// Health check
 	r.Get("/health", func(w http.ResponseWriter, r *http.Request) {
@@ -317,6 +327,7 @@ func NewRouter(h *APIHandler) (*chi.Mux, func()) {
 		r.Get("/invoices/{id}", h.HandleGetInvoiceByID)
 		r.Get("/invoices", h.HandleGetInvoices)
 		r.Get("/pool/stats", h.HandleGetPoolStats)
+		r.Get("/pool/snapshots", h.HandleGetPoolSnapshots)
 		r.Get("/pool/position/{address}", h.HandleGetLPPosition)
 	})
 
@@ -343,5 +354,17 @@ func NewRouter(h *APIHandler) (*chi.Mux, func()) {
 	return r, func() {
 		rl.Stop()
 		invoiceLimiter.Stop()
+	}
+}
+
+func metricsTokenMiddleware(expected string) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Header.Get("Authorization") != "Bearer "+expected {
+				http.Error(w, "Unauthorized", http.StatusUnauthorized)
+				return
+			}
+			next.ServeHTTP(w, r)
+		})
 	}
 }
